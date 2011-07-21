@@ -1,0 +1,309 @@
+<?php
+/**
+ * @file
+ * Code for the Site Deployment Data Services feature.
+ */
+
+include_once('extranet_dataservices.features.inc');
+
+/**
+ * Implements hook_menu().
+ */
+function extranet_dataservices_menu() {
+  $items = array();
+  $items['admin/config/services/extranet-dataservices'] = array(
+    'title' => 'Extranet Services Administration',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('extranet_dataservices_admin_form'),
+    'access arguments' => array('administer extranet data services'),
+  );
+  $items['extranet-dataservices/get-site-info'] = array(
+    'title' => '',
+    'page callback' => 'extranet_dataservices_site_info_service_callback',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['extranet-dataservices/get-site-info/%'] = array(
+    'title' => '',
+    'page callback' => 'extranet_dataservices_site_info_service_callback',
+    'page arguments' => array(2),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function extranet_dataservices_permission() {
+  return array(
+    'administer extranet data services' => array(
+      'title' => t('Administer Extranet Data Services'),
+      'description' => t('Control api key and other settings for the data callback.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function extranet_dataservices_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'site_node_form') {
+    $form['#validate'][] = 'extranet_dataservices_site_node_form_validate';
+  }
+}
+
+/**
+ * Validation of a the site node form.
+ */
+function extranet_dataservices_site_node_form_validate($form, &$form_state) {
+  $language = $form['field_machine_name']['#language'];
+  $name = $form_state['values']['field_machine_name'][$language][0]['value'];
+  // Ensure machine name is alphanumeric.
+  if (preg_match('/[^a-zA-Z0-9_]/', $name)) {
+    form_set_error('field_machine_name', t('Machine name must be alphanumeric and underscores only.'));
+  }
+  
+  // Ensure that this machine name is unique.
+  $nid = $form_state['values']['nid'] ? $form_state['values']['nid'] : 0;
+  $results = db_select('field_data_field_machine_name', 'f')
+      ->fields('f')
+      ->condition('field_machine_name_value', $name, '=')
+      ->condition('entity_type', 'node', '=')
+      ->condition('bundle', 'site', '=')
+      ->condition('entity_id', $nid, '!=')
+      ->execute();
+  $record = $results->fetchObject();
+  if (is_object($record)) {
+    form_set_error('field_machine_name', t('The machine name %name is already being used by another site.', array('%name' => $name)));
+  }
+
+}
+
+/**
+ * Administration form for extranet dataservices.
+ */
+function extranet_dataservices_admin_form($form, &$form_state) {
+  $form['extranet_dataservices_api_key'] = array(
+    '#title' => t('API Key'),
+    '#type' => 'textfield',
+    '#description' => t('Key used to access the services callback.'),
+    '#default_value' => variable_get('extranet_dataservices_api_key', NULL),
+  );
+  return system_settings_form($form);
+}
+
+/**
+ * Callback for getting structured site info.
+ */
+function extranet_dataservices_site_info_service_callback($sitename = NULL) {
+  // Disable page caching.
+  global $GLOBALS;
+  $GLOBALS['conf']['cache'] = FALSE;
+
+  $site_display = is_null($sitename) ? t('all sites') : $sitename;
+  if (!variable_get('extranet_dataservices_debug_mode', FALSE) && (!isset($_POST['api_key']) || !extranet_dataservices_service_validate_api_key($_POST['api_key']))) {
+    watchdog('extranet_dataservices', t('Access denied on Attempt to get site info for %site.', array('%site' => $site_display)));
+    die();
+  }
+
+  if (!is_null($sitename)) {
+    $data = extranet_dataservices_get_site_info($sitename);
+    extranet_dataservices_objectify($data);
+  }
+  else {
+    $data = extranet_dataservices_get_all_site_info();
+  }
+  if (!is_null($data)) {
+    watchdog('extranet_dataservices', t('Attempt to get site info on %site succeeded.', array('%site' => $site_display)));
+  }
+  else {
+    watchdog('extranet_dataservices', t('Attempt to get site info on %site failed.', array('%site' => $site_display)));
+  }
+  print json_encode($data);
+  exit;
+}
+
+/**
+ * Validate an api key for sit info.
+ */
+function extranet_dataservices_service_validate_api_key($api_key) {
+  // TODO: In the future, add in per user/per server api key validation.
+  return (!is_null($api_key) && $api_key == variable_get('extranet_dataservices_api_key', NULL)) ? TRUE : FALSE;
+}
+
+/**
+ * Load all published nodes of type 'site'.
+ */
+function extranet_dataservices_get_all_site_nodes() {
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'node', '=')
+    ->propertyCondition('type', 'site', '=')
+    ->propertyCondition('status', 1, '=')
+    ->fieldCondition('field_allow_getsite', 'value', 1, '=')
+    ->execute();
+  $nodes = node_load_multiple(array_keys($result['node']));
+  return $nodes;
+}
+
+/**
+ * Retrieve site info from all sites.
+ */
+function extranet_dataservices_get_all_site_info() {
+  $all_data = array();
+  $nodes = extranet_dataservices_get_all_site_nodes();
+  if (count($nodes)) {
+    foreach ($nodes as $nid => $node) {
+      $data = extranet_dataservices_get_site_info_from_node($node);
+      extranet_dataservices_objectify($data);
+      if (is_array($data)) {
+        $all_data += $data;
+      }
+    }
+  }
+  return $all_data;
+}
+
+/**
+ * Retrive sit info froma single site.
+ */
+function extranet_dataservices_get_site_info($sitename) {
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'node', '=')
+    ->propertyCondition('type', 'site', '=')
+    ->propertyCondition('status', 1, '=')
+    ->fieldCondition('field_machine_name', 'value', $sitename, '=')
+    ->fieldCondition('field_allow_getsite', 'value', 1, '=')
+    ->execute();
+
+  if (!isset($result['node'])) {
+    return NULL;
+  }
+
+  $node = node_load(array_pop(array_keys($result['node'])));
+  $data = extranet_dataservices_get_site_info_from_node($node);
+  return $data;
+}
+
+/**
+ * Retrieve site info from a given node.
+ */
+function extranet_dataservices_get_site_info_from_node($node) {
+  $data = new stdclass;
+/*
+  defaults = {
+    # (Required) The name of the client for whom this site is maintained.
+    # 'client' : 'zivtech',
+    # The path to the remote repository.
+    #(Required) 'repository' : 'https://zivtech.unfuddle.com/svn/zivtech_dahon',
+    # The ssh alias for the host this site is hosted on.
+    # Optional, defaults to site lisa (our dev server).
+    'host' : 'lisa',           
+    # Optional, defaults to host. The PHP head (or heads) where the site is hosted.
+    # 'code hosts' : "{'lisa'}"
+    # Optional, defaults to host.  The server where the files are stored 
+    # (may be an NFS server on large sites).
+    # 'files host' : 'lisa',
+    # Optional, defaults to site name key.  The MySQL server for the site.
+    # 'mysql host' : 'lisa',
+    # Number of times to run cron per hour.  Optional, defaults to 1.
+    'cron_frequency' : 1,      
+    # Optional, defaults to site name key. The path to the MySQL host
+    # 'webroot' : 'dahon-dev',   
+    # Optional, specify the VCS used for this site.
+    # Currently supports svn and git.
+    'vcs' : 'svn',             
+    # Optional, specify the major Drupal version used for this site.
+    # Currently supports D6 and D7.
+    'version' : 'D7',
+    # Optional, specify if this site uses private files.
+    # Default is no.
+    'private files' : False,
+  }
+*/
+
+  
+  // DONE:
+  // TODO: Add field_machine_name for site name?
+  // TODO: We need a field for the repository - field_repository
+  // TODO: We have no private files setup - field_private_files
+  // TODO: We should match the possibles version values in the getSite script for getting version.
+
+  // NOT DONE:
+  // TODO: Set mysql host to default to host, if it's not available. (Not setup for multiple mysql heads - may not matter).
+
+  // WONT DO:
+  // TODO: We have no cron frequency.
+  // TODO: We have no files host.
+  // TODO: We do not have code hosts setup (for multiple php heads)
+  // TODO: Data on production root is not standard.
+  // TODO: Client should not be required.  There's no client field yet.
+  // TODO: Hosts are full domain listings for most sites.  getSite should use the full host.
+  $name = extranet_dataservices_get_site_info_from_text_field($node, 'field_machine_name');
+  if (!$name) {
+    // Not having a name will mess up the json.
+    return NULL;
+  }
+
+  $data->repository = extranet_dataservices_get_site_info_from_text_field($node, 'field_repository');
+  $data->vcs = strtolower(extranet_dataservices_get_site_info_from_list_field($node, 'field_site_vcs'));
+  $host = node_load(extranet_dataservices_get_site_info_from_nodereference_field($node, 'field_server'));
+  $data->host = extranet_dataservices_get_site_info_from_text_field($host, 'field_server_hostname');
+  $data->webroot = extranet_dataservices_get_site_info_from_text_field($node, 'field_documentroot');
+  $data->version = extranet_dataservices_get_site_info_from_list_field($node, 'field_site_drupal_version');
+  $data->{'private files'} = extranet_dataservices_get_site_info_from_boolean_field($node, 'field_private_files');
+  return array($name => $data);
+}
+
+/**
+ * Retrieve sanitized value of a text field on a node.
+ */
+function extranet_dataservices_get_site_info_from_text_field($node, $field_name) {
+  $field = field_get_items('node', $node, $field_name);
+  return $field[0]['safe_value'];
+}
+
+/**
+ * Retrieve sanitized value of a list field on a node.
+ */
+function extranet_dataservices_get_site_info_from_list_field($node, $field_name) {
+  $field = field_get_items('node', $node, $field_name);
+  $stored_value = $field[0]['value'];
+  $field_info = field_info_field($field_name);
+  $value = isset($field_info['settings']['allowed_values'][$stored_value]) ? $field_info['settings']['allowed_values'][$stored_value] : NULL;
+  return check_plain($value);
+}
+
+/**
+ * Retrieve nid value from a node reference field on a node.
+ */
+function extranet_dataservices_get_site_info_from_nodereference_field($node, $field_name) {
+  $field = field_get_items('node', $node, $field_name);
+  return $field[0]['nid'];
+}
+
+/**
+ * Retrieve boolean value of a boolean field on a node.
+ */
+function extranet_dataservices_get_site_info_from_boolean_field($node, $field_name) {
+  $field = field_get_items('node', $node, $field_name);
+  return $field[0]['value'] ? TRUE : FALSE;
+}
+
+/** 
+ * Ensure that we don't create empty linear arrays for any associative object
+ * by recursively making all arrays into objects prior to running json_encode().
+ */
+function extranet_dataservices_objectify(&$data) {
+  if (is_object($data) || is_array($data)) {
+    foreach ($data as $name => &$value) {
+      extranet_dataservices_objectify($value);
+      if (is_array($value)) {
+        $value = (object) $value;
+      }
+    }
+  }
+}
